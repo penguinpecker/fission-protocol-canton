@@ -52,16 +52,24 @@ export class MarketsService {
   }
 
   /**
-   * List all PY markets across all assets.
+   * List all PY markets across all assets. Deduplicates by (assetCode, maturity)
+   * so re-bootstrapped PyMarket clones don't leak as separate rows.
    */
   async listMarkets(): Promise<Market[]> {
-    const markets = await this.ledger.queryActiveContracts<{
+    const allMarkets = await this.ledger.queryActiveContracts<{
       assetCode: { unAssetCode: string };
       maturity: { unMaturity: string };
       ptInstrumentId: { unInstrumentId: string };
       ytInstrumentId: { unInstrumentId: string };
       syInstrumentId: { unInstrumentId: string };
     }>('#fission-py:Fission.PY:PyMarket', [this.operatorParty]);
+
+    const dedup = new Map<string, typeof allMarkets[number]>();
+    for (const m of allMarkets) {
+      const key = `${m.payload.assetCode.unAssetCode}|${new Date(m.payload.maturity.unMaturity).getTime()}`;
+      if (!dedup.has(key)) dedup.set(key, m);
+    }
+    const markets = [...dedup.values()];
 
     const result: Market[] = [];
     const now = Date.now();
