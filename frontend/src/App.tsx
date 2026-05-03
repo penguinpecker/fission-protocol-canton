@@ -1022,19 +1022,21 @@ function Trade({ mi, st, nav }: { mi: number; st: string; nav: (h: string) => vo
               ) : (
                 <button
                   onClick={execute}
-                  disabled={!amt || phase === "submitting"}
+                  disabled={!amt || parseFloat(amt) <= 0 || phase === "submitting"}
                   className="w-full py-4 font-headline font-bold uppercase tracking-widest hover:brightness-110 disabled:opacity-40 border-none"
                   style={{ background: s.color, color: "#003919" }}
                 >
                   {phase === "submitting"
                     ? "Submitting…"
-                    : s.id === "split"
-                      ? "Split SY → PT + YT"
-                      : s.id === "fixed"
-                        ? "Lock Fixed Yield"
-                        : s.id === "long"
-                          ? "Long Yield"
-                          : "Add Liquidity (n/a)"}
+                    : !amt || parseFloat(amt) <= 0
+                      ? "Enter amount above ↑"
+                      : s.id === "split"
+                        ? "Split SY → PT + YT"
+                        : s.id === "fixed"
+                          ? "Lock Fixed Yield"
+                          : s.id === "long"
+                            ? "Long Yield"
+                            : "Add Liquidity (n/a)"}
                 </button>
               )}
 
@@ -1197,14 +1199,18 @@ function Swap() {
           ) : (
             <button
               onClick={execute}
-              disabled={!amt || phase === "submitting"}
+              disabled={!amt || parseFloat(amt) <= 0 || phase === "submitting"}
               className="w-full py-4 font-headline font-bold uppercase tracking-widest hover:brightness-110 disabled:opacity-40 border-none"
               style={{
                 background: dir === "SyToPt" ? "#00ff88" : "#ff6b35",
                 color: dir === "SyToPt" ? "#003919" : "#fff",
               }}
             >
-              {phase === "submitting" ? "Submitting…" : "Submit Swap"}
+              {phase === "submitting"
+                ? "Submitting…"
+                : !amt || parseFloat(amt) <= 0
+                  ? "Enter amount above ↑"
+                  : "Submit Swap"}
             </button>
           )}
           {err && (
