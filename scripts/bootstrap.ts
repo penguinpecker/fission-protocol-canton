@@ -302,6 +302,19 @@ async function main(): Promise<void> {
   const oneYear = new Date(Date.now() + 365 * 86_400_000).toISOString();
 
   for (const user of [alice, bob]) {
+    const userName = user.party.split('::')[0];
+    const existing = (await listContracts(
+      '#fission-credential:Fission.Credential:KycCertificate',
+      [user.party],
+    )) as Array<{ payload: { user: string; expiresAt: string } }>;
+    const valid = existing.find(
+      (c) => c.payload.user === user.party && new Date(c.payload.expiresAt).getTime() > Date.now(),
+    );
+    if (valid) {
+      console.log(`  ${userName} already has a valid KYC cert; skipping`);
+      continue;
+    }
+
     const proposal = (await ledger.createContract({
       templateId: '#fission-credential:Fission.Credential:KycCertificateProposal',
       argument: {
@@ -326,7 +339,7 @@ async function main(): Promise<void> {
       argument: {},
       actAs: [user.party],
     });
-    console.log(`  KYC issued to ${user.party.split('::')[0]}`);
+    console.log(`  KYC issued to ${userName}`);
   }
 
   // ---------------------------------------------------------------

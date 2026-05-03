@@ -123,14 +123,31 @@ async function pollAndPublish(client: LedgerClient): Promise<void> {
     return;
   }
 
-  // Trigger the ratchet on every active PY market for this asset.
-  const indexStates = await client.queryActiveContracts(
+  // Trigger the ratchet on every distinct (asset, maturity) pair. Multiple
+  // PyIndexState contracts may exist after re-bootstraps; ratchet only the
+  // freshest one per maturity (largest lastUpdated timestamp).
+  const allStates = (await client.queryActiveContracts(
     '#fission-py:Fission.PY:PyIndexState',
     [ORACLE_PARTY],
-  );
+  )) as Array<{
+    contractId: string;
+    payload: {
+      assetCode: { unAssetCode: string };
+      maturity: { unMaturity: string };
+      lastUpdated: string;
+    };
+  }>;
+  const freshestByMaturity = new Map<string, typeof allStates[number]>();
+  for (const s of allStates) {
+    if (s.payload.assetCode.unAssetCode !== ASSET_CODE) continue;
+    const key = s.payload.maturity.unMaturity;
+    const existing = freshestByMaturity.get(key);
+    if (!existing || new Date(s.payload.lastUpdated) > new Date(existing.payload.lastUpdated)) {
+      freshestByMaturity.set(key, s);
+    }
+  }
 
-  for (const state of indexStates) {
-    if (state.payload.assetCode.unAssetCode !== ASSET_CODE) continue;
+  for (const state of freshestByMaturity.values()) {
     const matTime = new Date(state.payload.maturity.unMaturity).getTime();
     if (matTime <= Date.now()) continue; // matured market
 
