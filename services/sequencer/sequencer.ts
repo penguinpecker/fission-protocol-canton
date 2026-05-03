@@ -77,6 +77,12 @@ async function settleBatch(client: LedgerClient, group: PoolGroup): Promise<void
     return;
   }
 
+  // SettleBatch archives each PendingSwap; PendingSwap's signatories are
+  // trader + custodian, so the custodian must co-authorize. operator is added
+  // to readAs because the choice fetches the AmmPool / index state.
+  const custodian = process.env.CUSTODIAN_PARTY;
+  const operator = process.env.OPERATOR_PARTY;
+  if (!custodian) throw new Error('CUSTODIAN_PARTY env var required for sequencer');
   await client.exerciseChoice({
     templateId: '#fission-amm:Fission.AMM:AmmPool',
     contractId: pool.contractId,
@@ -84,7 +90,10 @@ async function settleBatch(client: LedgerClient, group: PoolGroup): Promise<void
     argument: {
       pendingCids: swapsToSettle.map((s) => s.contractId),
     },
-    actAs: [SEQUENCER_PARTY],
+    actAs: [SEQUENCER_PARTY, custodian],
+    readAs: operator
+      ? [SEQUENCER_PARTY, custodian, operator]
+      : [SEQUENCER_PARTY, custodian],
   });
 }
 

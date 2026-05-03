@@ -5,14 +5,51 @@ interface Props {
   onClose: () => void;
 }
 
-const KEYCLOAK_TOKEN_URL =
-  import.meta.env.VITE_KEYCLOAK_TOKEN_URL ??
-  'http://keycloak.localhost:8082/realms/AppUser/protocol/openid-connect/token';
+const LEDGER_HMAC_SECRET = import.meta.env.VITE_LEDGER_HMAC_SECRET ?? 'unsafe';
+const LEDGER_AUDIENCE =
+  import.meta.env.VITE_LEDGER_AUDIENCE ?? 'https://canton.network.global';
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
 
 const DEMO_USERS = [
-  { name: 'alice', client: 'app-user-alice', secret: 'demo-secret-alice' },
-  { name: 'bob', client: 'app-user-bob', secret: 'demo-secret-bob' },
+  { name: 'alice', label: 'Alice (Demo Trader)' },
+  { name: 'bob', label: 'Bob (Demo LP)' },
 ];
+
+function b64uString(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+/**
+ * Mint an HS256 JWT in the browser. Splice 0.6.2 LocalNet's "unsafe" auth
+ * mode accepts these. In production this would be done by a real wallet
+ * (CIP-103 dApp SDK) — not the dApp itself.
+ */
+async function mintLocalToken(userId: string, party: string): Promise<string> {
+  const enc = new TextEncoder();
+  const headerJson = JSON.stringify({ alg: 'HS256', typ: 'JWT' });
+  const payloadJson = JSON.stringify({
+    sub: userId,
+    aud: LEDGER_AUDIENCE,
+    scope: 'daml_ledger_api',
+    party,
+  });
+  const header = b64uString(enc.encode(headerJson));
+  const payload = b64uString(enc.encode(payloadJson));
+  const signingInput = `${header}.${payload}`;
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(LEDGER_HMAC_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sigBuf = await crypto.subtle.sign('HMAC', key, enc.encode(signingInput));
+  const sig = b64uString(new Uint8Array(sigBuf));
+  return `${signingInput}.${sig}`;
+}
 
 export function ConnectModal({ onClose }: Props) {
   const { connect } = useWallet();
@@ -26,33 +63,18 @@ export function ConnectModal({ onClose }: Props) {
     setBusy(true);
     setErr(null);
     try {
-      // Mint a token via Keycloak client_credentials. In a real wallet, the
-      // wallet itself signs and we never see the secret. For LocalNet demo
-      // we accept this shortcut.
-      const res = await fetch(KEYCLOAK_TOKEN_URL, {
+      // Resolve the party from the user-id. The backend looks it up via
+      // /v2/users on the participant.
+      const partyRes = await fetch(`${API_URL}/api/auth/resolve-party`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'client_credentials',
-          client_id: user.client,
-          client_secret: user.secret,
-          scope: 'openid',
-        }),
-      });
-      if (!res.ok) throw new Error(`Keycloak returned ${res.status}`);
-      const data = (await res.json()) as { access_token: string };
-
-      // Resolve the party from the user. In LocalNet the bootstrap script
-      // creates parties with hint = user.name; we look it up via the backend.
-      const partyRes = await fetch('/api/auth/resolve-party', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${data.access_token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.name }),
       });
       if (!partyRes.ok) throw new Error(`Failed to resolve party for ${user.name}`);
       const { party } = (await partyRes.json()) as { party: string };
 
-      connect(party, data.access_token, user.name);
+      const token = await mintLocalToken(user.name, party);
+      connect(party, token, user.name);
       onClose();
     } catch (e) {
       setErr(String(e));

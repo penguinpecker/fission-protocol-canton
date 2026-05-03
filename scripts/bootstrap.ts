@@ -382,6 +382,208 @@ async function main(): Promise<void> {
   }
 
   // ---------------------------------------------------------------
+  // 8. Deploy AmmPool per market and seed initial liquidity from Alice
+  // ---------------------------------------------------------------
+  console.log('\n[8/8] Deploying AmmPool + seeding liquidity...');
+
+  async function findCert(p: { party: string }): Promise<{ contractId: string }> {
+    const certs = (await listContracts(
+      '#fission-credential:Fission.Credential:KycCertificate',
+      [p.party],
+    )) as Array<{ contractId: string; payload: { user: string } }>;
+    const cert = certs.find((c) => c.payload.user === p.party);
+    if (!cert) throw new Error(`KYC cert missing for ${p.party.split('::')[0]}`);
+    return cert;
+  }
+
+  // Locate PyMarket and PyIndexState contracts per maturity.
+  const pyMarkets = (await listContracts(
+    '#fission-py:Fission.PY:PyMarket',
+    [operator.party],
+  )) as Array<{
+    contractId: string;
+    payload: {
+      assetCode: { unAssetCode: string };
+      maturity: { unMaturity: string };
+    };
+  }>;
+  const pyIndexStates = (await listContracts(
+    '#fission-py:Fission.PY:PyIndexState',
+    [operator.party],
+  )) as Array<{
+    contractId: string;
+    payload: {
+      assetCode: { unAssetCode: string };
+      maturity: { unMaturity: string };
+    };
+  }>;
+
+  const sameMaturity = (a: string, b: string): boolean =>
+    new Date(a).getTime() === new Date(b).getTime();
+
+  // Alternate LPs across markets so neither runs out of SY.
+  const lpForMaturity: Record<string, { party: string }> = {
+    DEC26: alice,
+    MAR27: bob,
+  };
+
+  for (const m of maturities) {
+    const lp = lpForMaturity[m.label];
+    const lpCert = await findCert(lp);
+    const market = pyMarkets.find(
+      (p) =>
+        p.payload.assetCode.unAssetCode === 'USYC' &&
+        sameMaturity(p.payload.maturity.unMaturity, m.iso),
+    );
+    const indexState = pyIndexStates.find(
+      (p) =>
+        p.payload.assetCode.unAssetCode === 'USYC' &&
+        sameMaturity(p.payload.maturity.unMaturity, m.iso),
+    );
+    if (!market || !indexState) {
+      console.error(`  market or index state missing for ${m.label}; skipping pool`);
+      continue;
+    }
+
+    // Idempotency: skip if a pool already exists for this maturity.
+    const existingPools = (await listContracts(
+      '#fission-amm:Fission.AMM:AmmPool',
+      [operator.party],
+    )) as Array<{
+      contractId: string;
+      payload: {
+        poolId: { assetCode: { unAssetCode: string }; maturity: { unMaturity: string } };
+        syReserve: string;
+        ptReserve: string;
+      };
+    }>;
+    let pool = existingPools.find(
+      (p) =>
+        p.payload.poolId.assetCode.unAssetCode === 'USYC' &&
+        sameMaturity(p.payload.poolId.maturity.unMaturity, m.iso),
+    );
+
+    if (!pool) {
+      const poolRes = (await ledger.createContract({
+        templateId: '#fission-amm:Fission.AMM:AmmPool',
+        argument: {
+          issuer: operator.party,
+          sequencer: sequencer.party,
+          poolId: {
+            assetCode: { unAssetCode: 'USYC' },
+            maturity: { unMaturity: m.iso },
+          },
+          custodian: custodian.party,
+          requiredTier: 'AccreditedInvestor',
+          syInstrumentId: { unInstrumentId: 'SY-USYC' },
+          ptInstrumentId: { unInstrumentId: `PT-USYC-${m.label}` },
+          syReserve: '0.0',
+          ptReserve: '0.0',
+          totalLpShares: '0.0',
+          scalarRoot: '50.0',
+          initialAnchor: '1.0',
+          feeRate: '0.001',
+          lastSettledAt: now,
+          public: publicParty.party,
+        },
+        actAs: [operator.party],
+      })) as {
+        events: Array<{ created?: { contractId: string; templateId: string } }>;
+      };
+      const newCid = poolRes.events.find((e) => e.created)?.created?.contractId;
+      if (!newCid) throw new Error(`AmmPool create returned no contractId for ${m.label}`);
+      console.log(`  deployed AmmPool USYC-${m.label}`);
+      pool = {
+        contractId: newCid,
+        payload: {
+          poolId: { assetCode: { unAssetCode: 'USYC' }, maturity: { unMaturity: m.iso } },
+          syReserve: '0.0',
+          ptReserve: '0.0',
+        },
+      };
+    } else {
+      console.log(`  AmmPool USYC-${m.label} already exists`);
+    }
+
+    // Skip liquidity seeding if pool already has reserves.
+    if (parseFloat(pool.payload.syReserve) > 0 || parseFloat(pool.payload.ptReserve) > 0) {
+      console.log(`  USYC-${m.label} pool already seeded`);
+      continue;
+    }
+
+    const lpName = lp.party.split('::')[0];
+    // Find LP's SY-USYC holding.
+    const lpSyHoldings = (await listContracts(
+      '#fission-sy:Fission.SY:SyHolding',
+      [lp.party],
+    )) as Array<{
+      contractId: string;
+      payload: { instrumentId: { unInstrumentId: string }; amount: string };
+    }>;
+    const lpSy = lpSyHoldings.find((h) => h.payload.instrumentId.unInstrumentId === 'SY-USYC');
+    if (!lpSy || parseFloat(lpSy.payload.amount) < 500) {
+      console.error(`  ${lpName} has insufficient SY (need ≥500); skipping ${m.label} liquidity seed`);
+      continue;
+    }
+
+    // LP splits 500 SY → 500 PT + 500 YT for this maturity.
+    // readAs operator: PyIndexState's only observers are oracle+public; we need
+    // operator (signatory) in readAs so MintPY can fetch indexStateCid.
+    const mintRes = (await ledger.exerciseChoice({
+      templateId: '#fission-py:Fission.PY:PyMarket',
+      contractId: market.contractId,
+      choice: 'MintPY',
+      argument: {
+        owner: lp.party,
+        syHoldingCid: lpSy.contractId,
+        amount: '500.0',
+        kycCertCid: lpCert.contractId,
+        indexStateCid: indexState.contractId,
+      },
+      actAs: [lp.party, custodian.party],
+      readAs: [lp.party, custodian.party, operator.party, oracle.party],
+    })) as {
+      events: Array<{ created?: { contractId: string; templateId: string } }>;
+    };
+    const ptEvt = mintRes.events.find((e) => e.created?.templateId.includes(':PtHolding'));
+    const ptCid = ptEvt?.created?.contractId;
+    if (!ptCid) throw new Error(`PT not created for ${m.label}`);
+    console.log(`  ${lpName} split 500 SY → 500 PT-USYC-${m.label} + 500 YT-USYC-${m.label}`);
+
+    // LP now has residual SY + 500 PT + 500 YT. Provide 250 SY + 250 PT.
+    const lpSyAfter = (await listContracts(
+      '#fission-sy:Fission.SY:SyHolding',
+      [lp.party],
+    )) as Array<{
+      contractId: string;
+      payload: { instrumentId: { unInstrumentId: string }; amount: string };
+    }>;
+    const syToProvide = lpSyAfter.find(
+      (h) => h.payload.instrumentId.unInstrumentId === 'SY-USYC' && parseFloat(h.payload.amount) >= 250,
+    );
+    if (!syToProvide) {
+      console.error(`  ${lpName} has no SY ≥250 to provide for ${m.label}; skipping`);
+      continue;
+    }
+
+    await ledger.exerciseChoice({
+      templateId: '#fission-amm:Fission.AMM:AmmPool',
+      contractId: pool.contractId,
+      choice: 'ProvideLiquidity',
+      argument: {
+        provider: lp.party,
+        syCid: syToProvide.contractId,
+        ptCid,
+        syAmount: '250.0',
+        ptAmount: '250.0',
+        kycCertCid: lpCert.contractId,
+      },
+      actAs: [lp.party, custodian.party],
+    });
+    console.log(`  ${lpName} provided 250 SY + 250 PT to USYC-${m.label} pool`);
+  }
+
+  // ---------------------------------------------------------------
   // Done
   // ---------------------------------------------------------------
   const envContent = `# Generated by scripts/bootstrap.ts on ${new Date().toISOString()}

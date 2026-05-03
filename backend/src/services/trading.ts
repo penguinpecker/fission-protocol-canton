@@ -110,8 +110,8 @@ export class TradingService {
         amountIn: req.amountIn,
         minAmountOut: req.minAmountOut,
         kycCertCid: kyc,
-        syHoldingCid: syHoldingCid ? { Some: syHoldingCid } : { None: {} },
-        ptHoldingCid: ptHoldingCid ? { Some: ptHoldingCid } : { None: {} },
+        syHoldingCid: syHoldingCid ?? null,
+        ptHoldingCid: ptHoldingCid ?? null,
       },
       actAs: [party, this.custodianParty],
     });
@@ -138,6 +138,8 @@ export class TradingService {
     const kyc = await this.findKyc(party);
     if (!kyc) throw new Error('No valid KYC certificate');
 
+    // readAs operator: PyIndexState observers are oracle+public only; the
+    // exercising owner needs operator (signatory) in readAs to fetch indexStateCid.
     return this.ledger.exerciseChoice({
       templateId: '#fission-py:Fission.PY:YtHolding',
       contractId: req.ytContractId,
@@ -148,6 +150,7 @@ export class TradingService {
         syInstrumentId: { unInstrumentId: `SY-${yt.payload.assetCode.unAssetCode}` },
       },
       actAs: [party, this.custodianParty],
+      readAs: [party, this.custodianParty, this.operatorParty],
     });
   }
 

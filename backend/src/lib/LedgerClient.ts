@@ -359,10 +359,17 @@ function keysEqual(payload: Record<string, unknown>, key: unknown): boolean {
   return false;
 }
 
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (a === null || b === null) return false;
   if (typeof a !== typeof b) return false;
+  // ISO-8601 timestamps: compare by Date.parse so "2026-12-31T16:00:00Z"
+  // equals "2026-12-31T16:00:00.000Z" (Canton drops trailing zero ms).
+  if (typeof a === 'string' && typeof b === 'string' && ISO_RE.test(a) && ISO_RE.test(b)) {
+    return Date.parse(a) === Date.parse(b);
+  }
   if (typeof a !== 'object') return a === b;
   const aObj = a as Record<string, unknown>;
   const bObj = b as Record<string, unknown>;

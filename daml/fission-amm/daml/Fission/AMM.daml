@@ -151,10 +151,13 @@ template AmmPool
 
     -- | Sequencer settles a batch of pending swaps in a single transaction.
     --   This is what gives us throughput: 100 swaps -> 1 pool update.
+    -- Controllers include custodian so that PendingSwap (signatory issuer + custodian)
+    -- can be archived during settlement. Sequencer alone can't authorize archival of
+    -- contracts where custodian is a signatory.
     nonconsuming choice SettleBatch : ContractId AmmPool
       with
         pendingCids : [ContractId PendingSwap]
-      controller sequencer
+      controller sequencer, custodian
       do
         now <- getTime
         -- Read all pending swaps.
