@@ -1,0 +1,404 @@
+-- | Fission PY (Principal/Yield) Tokenization Engine
+--
+-- This is the heart of the protocol. It splits SY into PT and YT.
+--
+-- PT (Principal Token): claim on the underlying redeemable 1:1 at maturity.
+--                       Behaves like a zero-coupon bond.
+--
+-- YT (Yield Token):     claim on all yield accrued by the underlying between mint and maturity.
+--                       Holders can claim accrued yield at any time before maturity.
+--                       At maturity, YT becomes worthless (all yield has been distributed).
+--
+-- The PY-Index Ratchet is the critical solvency invariant. It tracks the cumulative yield
+-- index since YT issuance. Yield claims debit this index; PT redemption is unaffected.
+-- The "ratchet" only ever moves UP: if the underlying's exchange rate ever decreases
+-- (e.g. negative yield event), the index is held flat, protecting PT holders from
+-- being short-changed at maturity.
+--
+-- Key Daml idioms used:
+--   * UTXO-style PT and YT holdings (one contract per position) -> high parallelism
+--   * Per-(asset,maturity) singleton PyIndexState -> contention only on once-per-epoch ratchet
+--   * Atomic mint: a single transaction archives SY input and creates PT + YT outputs
+--   * Atomic redemption: at maturity, PT is exchanged for SY 1:1
+module Fission.PY where
+
+import Fission.Asset.Registry (AssetCode(..), CredentialClass)
+import Fission.Credential (KycCertificate, isCredentialValid)
+import Fission.SY (SyHolding(..), InstrumentId(..))
+import Fission.Oracle (YieldOracleFeed, getCurrentRate)
+
+-- | A specific maturity timestamp for a PY market. Markets with different maturities
+--   produce non-fungible PT and YT tokens (PT-USYC-Dec26 != PT-USYC-Mar27).
+newtype Maturity = Maturity { unMaturity : Time }
+  deriving (Eq, Show, Ord)
+
+-- | Compose a PT instrument id from an asset and maturity.
+mkPtInstrumentId : AssetCode -> Maturity -> InstrumentId
+mkPtInstrumentId (AssetCode c) (Maturity t) =
+  InstrumentId $ "PT-" <> c <> "-" <> show t
+
+-- | Compose a YT instrument id from an asset and maturity.
+mkYtInstrumentId : AssetCode -> Maturity -> InstrumentId
+mkYtInstrumentId (AssetCode c) (Maturity t) =
+  InstrumentId $ "YT-" <> c <> "-" <> show t
+
+-- ----------------------------------------------------------------
+-- The PY market: one per (asset, maturity).
+-- ----------------------------------------------------------------
+
+-- | The PY market metadata. Singleton per (issuer, asset, maturity).
+template PyMarket
+  with
+    issuer        : Party
+    assetCode     : AssetCode
+    maturity      : Maturity
+    custodian     : Party
+    oracleParty   : Party
+    requiredTier  : CredentialClass
+    syInstrumentId : InstrumentId
+    ptInstrumentId : InstrumentId
+    ytInstrumentId : InstrumentId
+    public        : Party
+  where
+    signatory issuer
+    observer public, custodian
+
+    -- | Atomically mint PT + YT from SY input.
+    --   Caller deposits SY of `amount`, receives PT and YT each of `amount`.
+    --   The 1:1:1 ratio is the invariant: PT(t) + YT(t) = SY at any point in time.
+    nonconsuming choice MintPY : (ContractId PtHolding, ContractId YtHolding)
+      with
+        owner        : Party
+        syHoldingCid : ContractId SyHolding
+        amount       : Decimal
+        kycCertCid   : ContractId KycCertificate
+        indexStateCid : ContractId PyIndexState
+      controller owner, custodian
+      do
+        now <- getTime
+        assertMsg "market already matured" (unMaturity maturity > now)
+        assertMsg "amount must be positive" (amount > 0.0)
+
+        -- Validate KYC.
+        cert <- fetch kycCertCid
+        assertMsg "KYC invalid for this tier"
+          (isCredentialValid now requiredTier cert)
+        assertMsg "KYC not for caller" (cert.user == owner)
+
+        -- Validate SY holding.
+        sy <- fetch syHoldingCid
+        assertMsg "SY instrument mismatch" (sy.instrumentId == syInstrumentId)
+        assertMsg "SY holding insufficient" (sy.amount >= amount)
+        assertMsg "SY owner mismatch" (sy.owner == owner)
+
+        -- Snapshot current index for YT yield accounting.
+        indexState <- fetch indexStateCid
+        let entryIndex = indexState.currentIndex
+
+        -- Consume SY (split if partial, archive if exact).
+        if sy.amount == amount
+          then archive syHoldingCid
+          else do
+            archive syHoldingCid
+            _ <- create sy with amount = sy.amount - amount
+            return ()
+
+        -- Mint PT and YT.
+        ptCid <- create PtHolding with
+          issuer = issuer
+          owner = owner
+          custodian = custodian
+          instrumentId = ptInstrumentId
+          assetCode = assetCode
+          maturity = maturity
+          amount = amount
+          mintedAt = now
+
+        ytCid <- create YtHolding with
+          issuer = issuer
+          owner = owner
+          custodian = custodian
+          instrumentId = ytInstrumentId
+          assetCode = assetCode
+          maturity = maturity
+          amount = amount
+          entryIndex = entryIndex
+          lastClaimedIndex = entryIndex
+          mintedAt = now
+
+        return (ptCid, ytCid)
+
+    -- | Atomically redeem PT + YT back to SY before maturity.
+    --   PT(t) + YT(t) = SY (t) is the invariant.
+    nonconsuming choice RedeemPY : ContractId SyHolding
+      with
+        owner       : Party
+        ptCid       : ContractId PtHolding
+        ytCid       : ContractId YtHolding
+        amount      : Decimal
+        kycCertCid  : ContractId KycCertificate
+      controller owner, custodian
+      do
+        now <- getTime
+        assertMsg "market already matured - use RedeemPostMaturity"
+          (unMaturity maturity > now)
+
+        cert <- fetch kycCertCid
+        assertMsg "KYC invalid" (isCredentialValid now requiredTier cert)
+
+        pt <- fetch ptCid
+        yt <- fetch ytCid
+        assertMsg "PT instrument mismatch" (pt.instrumentId == ptInstrumentId)
+        assertMsg "YT instrument mismatch" (yt.instrumentId == ytInstrumentId)
+        assertMsg "PT amount insufficient" (pt.amount >= amount)
+        assertMsg "YT amount insufficient" (yt.amount >= amount)
+        assertMsg "PT owner mismatch" (pt.owner == owner)
+        assertMsg "YT owner mismatch" (yt.owner == owner)
+
+        -- Burn PT + YT (split if partial).
+        if pt.amount == amount
+          then archive ptCid
+          else do
+            archive ptCid
+            _ <- create pt with amount = pt.amount - amount
+            return ()
+
+        if yt.amount == amount
+          then archive ytCid
+          else do
+            archive ytCid
+            _ <- create yt with amount = yt.amount - amount
+            return ()
+
+        -- Mint equivalent SY back to owner.
+        create SyHolding with
+          issuer = issuer
+          owner = owner
+          custodian = custodian
+          instrumentId = syInstrumentId
+          amount = amount
+          mintedAt = now
+
+    -- | After maturity, PT redeems 1:1 for SY (representing the original principal).
+    --   YT becomes worthless at maturity (all yield already distributed via ClaimYield).
+    nonconsuming choice RedeemPostMaturity : ContractId SyHolding
+      with
+        owner      : Party
+        ptCid      : ContractId PtHolding
+        amount     : Decimal
+        kycCertCid : ContractId KycCertificate
+      controller owner, custodian
+      do
+        now <- getTime
+        assertMsg "market not yet matured" (unMaturity maturity <= now)
+
+        cert <- fetch kycCertCid
+        assertMsg "KYC invalid" (isCredentialValid now requiredTier cert)
+
+        pt <- fetch ptCid
+        assertMsg "PT instrument mismatch" (pt.instrumentId == ptInstrumentId)
+        assertMsg "PT amount insufficient" (pt.amount >= amount)
+        assertMsg "PT owner mismatch" (pt.owner == owner)
+
+        if pt.amount == amount
+          then archive ptCid
+          else do
+            archive ptCid
+            _ <- create pt with amount = pt.amount - amount
+            return ()
+
+        create SyHolding with
+          issuer = issuer
+          owner = owner
+          custodian = custodian
+          instrumentId = syInstrumentId
+          amount = amount
+          mintedAt = now
+
+-- ----------------------------------------------------------------
+-- PT Holding (Principal Token)
+-- ----------------------------------------------------------------
+
+template PtHolding
+  with
+    issuer       : Party
+    owner        : Party
+    custodian    : Party
+    instrumentId : InstrumentId
+    assetCode    : AssetCode
+    maturity     : Maturity
+    amount       : Decimal
+    mintedAt     : Time
+  where
+    signatory issuer, custodian
+    observer owner
+
+    ensure amount > 0.0
+
+    choice TransferPt : ContractId PtHolding
+      with
+        newOwner   : Party
+        kycCertCid : ContractId KycCertificate
+      controller owner, custodian
+      do
+        cert <- fetch kycCertCid
+        assertMsg "recipient KYC mismatch" (cert.user == newOwner)
+        now <- getTime
+        assertMsg "recipient KYC expired" (cert.expiresAt > now)
+        create this with owner = newOwner
+
+    choice SplitPt : (ContractId PtHolding, ContractId PtHolding)
+      with
+        firstAmount : Decimal
+      controller owner
+      do
+        assertMsg "split amount must be positive" (firstAmount > 0.0)
+        assertMsg "split amount must be less than holding" (firstAmount < amount)
+        a <- create this with amount = firstAmount
+        b <- create this with amount = amount - firstAmount
+        return (a, b)
+
+    choice MergePt : ContractId PtHolding
+      with
+        otherCid : ContractId PtHolding
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "instrument mismatch" (other.instrumentId == instrumentId)
+        assertMsg "owner mismatch" (other.owner == owner)
+        archive otherCid
+        create this with amount = amount + other.amount
+
+-- ----------------------------------------------------------------
+-- YT Holding (Yield Token)
+-- ----------------------------------------------------------------
+-- The yield model: at mint, we snapshot the index. Each ClaimYield reads the current
+-- index from PyIndexState and pays out (currentIndex - lastClaimedIndex) * amount worth of SY.
+-- This is the "pull-based" model and it's the key reason this protocol scales on Canton:
+-- no global rebase; each YT holder's claim is independent.
+
+template YtHolding
+  with
+    issuer           : Party
+    owner            : Party
+    custodian        : Party
+    instrumentId     : InstrumentId
+    assetCode        : AssetCode
+    maturity         : Maturity
+    amount           : Decimal
+    -- | Index value at mint (or last claim). Yield payable = (currentIndex - lastClaimedIndex) * amount.
+    entryIndex       : Decimal
+    lastClaimedIndex : Decimal
+    mintedAt         : Time
+  where
+    signatory issuer, custodian
+    observer owner
+
+    ensure amount > 0.0 && lastClaimedIndex >= entryIndex
+
+    -- | Claim accrued yield. Pays out in SY.
+    choice ClaimYield : (ContractId YtHolding, Optional (ContractId SyHolding))
+      with
+        indexStateCid : ContractId PyIndexState
+        kycCertCid    : ContractId KycCertificate
+        syInstrumentId : InstrumentId
+      controller owner, custodian
+      do
+        now <- getTime
+        assertMsg "market matured - YT yields exhausted" (unMaturity maturity > now)
+
+        cert <- fetch kycCertCid
+        assertMsg "KYC mismatch" (cert.user == owner)
+        assertMsg "KYC expired" (cert.expiresAt > now)
+
+        indexState <- fetch indexStateCid
+        let currentIndex = indexState.currentIndex
+        let yieldPerUnit = currentIndex - lastClaimedIndex
+        assertMsg "no yield accrued" (yieldPerUnit >= 0.0)
+
+        let yieldAmount = yieldPerUnit * amount
+
+        newYt <- create this with lastClaimedIndex = currentIndex
+
+        if yieldAmount > 0.0
+          then do
+            syCid <- create SyHolding with
+              issuer = issuer
+              owner = owner
+              custodian = custodian
+              instrumentId = syInstrumentId
+              amount = yieldAmount
+              mintedAt = now
+            return (newYt, Some syCid)
+          else
+            return (newYt, None)
+
+    choice TransferYt : ContractId YtHolding
+      with
+        newOwner   : Party
+        kycCertCid : ContractId KycCertificate
+      controller owner, custodian
+      do
+        cert <- fetch kycCertCid
+        assertMsg "recipient KYC mismatch" (cert.user == newOwner)
+        now <- getTime
+        assertMsg "recipient KYC expired" (cert.expiresAt > now)
+        create this with owner = newOwner
+
+    choice SplitYt : (ContractId YtHolding, ContractId YtHolding)
+      with
+        firstAmount : Decimal
+      controller owner
+      do
+        assertMsg "split amount must be positive" (firstAmount > 0.0)
+        assertMsg "split amount must be less than holding" (firstAmount < amount)
+        a <- create this with amount = firstAmount
+        b <- create this with amount = amount - firstAmount
+        return (a, b)
+
+-- ----------------------------------------------------------------
+-- PY Index State - the ratchet that protects PT holders
+-- ----------------------------------------------------------------
+-- One singleton per (assetCode, maturity). Updated once per oracle epoch by the issuer/keeper.
+-- The non-consuming GetCurrentIndex choice is what makes this scale: thousands of YT holders
+-- can read it in parallel without contention.
+
+template PyIndexState
+  with
+    issuer       : Party
+    oracleParty  : Party
+    assetCode    : AssetCode
+    maturity     : Maturity
+    -- | Monotonically non-decreasing. Updated by RatchetIndex from the oracle feed.
+    currentIndex : Decimal
+    lastUpdated  : Time
+    public       : Party
+  where
+    signatory issuer
+    observer oracleParty, public
+
+    ensure currentIndex >= 0.0
+
+    -- | Oracle keeper updates the index. CRITICAL: ratchet semantics.
+    --   newIndex >= currentIndex always. If the oracle reports a lower rate, we hold flat.
+    --   This is what protects PT holders from negative-yield events.
+    choice RatchetIndex : ContractId PyIndexState
+      with
+        oracleFeedCid : ContractId YieldOracleFeed
+      controller oracleParty
+      do
+        now <- getTime
+        assertMsg "market matured" (unMaturity maturity > now)
+        feed <- fetch oracleFeedCid
+        assertMsg "oracle feed asset mismatch" (feed.assetCode == assetCode)
+        let observedIndex = getCurrentRate feed
+        let newIndex = max currentIndex observedIndex
+        create this with
+          currentIndex = newIndex
+          lastUpdated = now
+
+    -- | Pure read - non-consuming, no contention.
+    nonconsuming choice GetCurrentIndex : Decimal
+      controller oracleParty
+      do
+        return currentIndex

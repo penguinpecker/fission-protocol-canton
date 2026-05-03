@@ -1,0 +1,18 @@
+sdk-version: 3.4.11
+name: fission-tests
+source: daml
+version: 0.1.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../fission-asset-registry/.daml/dist/fission-asset-registry-0.1.0.dar
+  - ../fission-credential/.daml/dist/fission-credential-0.1.0.dar
+  - ../fission-sy/.daml/dist/fission-sy-0.1.0.dar
+  - ../fission-py/.daml/dist/fission-py-0.1.0.dar
+  - ../fission-oracle/.daml/dist/fission-oracle-0.1.0.dar
+  - ../fission-amm/.daml/dist/fission-amm-0.1.0.dar
+  - ../fission-amm/.daml/dist/fission-amm-0.1.0.dar
+build-options:
+  - --target=2.1

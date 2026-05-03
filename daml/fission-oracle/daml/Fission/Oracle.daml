@@ -1,0 +1,73 @@
+-- | Fission Oracle
+-- Publishes yield-rate observations for registered underlyings. The oracle keeper service
+-- (off-ledger) polls the canonical source (USYC NAV API, Chainlink, etc.) and submits
+-- a `Publish` choice once per epoch.
+--
+-- Observations are non-consuming reads: the PY ratchet contract uses them to compute
+-- the new index without contending on a shared mutable state, then performs its own
+-- update on a per-(asset,maturity) singleton.
+module Fission.Oracle where
+
+import Fission.Asset.Registry (AssetCode(..))
+
+-- | A single yield observation.
+data YieldObservation = YieldObservation
+  with
+    assetCode    : AssetCode
+    -- | The exchange rate as of `observedAt`. For rising-NAV tokens, this is the NAV
+    --   normalized to 1.0 at issuance. For streaming yield, this represents accrued value.
+    exchangeRate : Decimal
+    observedAt   : Time
+    -- | Annualized rate at the time of observation (informational, used for UI).
+    apr          : Decimal
+  deriving (Eq, Show)
+
+-- | An on-ledger record of an oracle observation.
+--   Lives until the next observation supersedes it. Non-consuming reads make this
+--   parallel-safe: thousands of YT holders can fetch it in the same epoch without contention.
+template YieldOracleFeed
+  with
+    oracleParty   : Party
+    assetCode     : AssetCode
+    latest        : YieldObservation
+    -- | Bounded-history of recent observations for charting in the UI.
+    history       : [YieldObservation]
+    public        : Party
+  where
+    signatory oracleParty
+    observer public
+
+    ensure latest.exchangeRate > 0.0
+
+    -- | Oracle keeper publishes a new observation. Re-creates the contract with the new rate.
+    --   Caps history at 256 entries to bound storage.
+    choice Publish : ContractId YieldOracleFeed
+      with
+        observation : YieldObservation
+      controller oracleParty
+      do
+        assertMsg "observation must be for this asset"
+          (observation.assetCode == assetCode)
+        assertMsg "exchange rate must be positive"
+          (observation.exchangeRate > 0.0)
+        assertMsg "observation must be newer than latest"
+          (observation.observedAt > latest.observedAt)
+        create this with
+          latest = observation
+          history = take 256 (observation :: latest :: history)
+
+    -- | Pure read of the current rate.
+    nonconsuming choice GetCurrentRate : Decimal
+      controller oracleParty
+      do
+        return latest.exchangeRate
+
+-- | Helper exposed to other modules: read the current rate from a fetched feed.
+getCurrentRate : YieldOracleFeed -> Decimal
+getCurrentRate feed = feed.latest.exchangeRate
+
+-- | Helper: compute the implied APR over a window from two observations.
+impliedApr : YieldObservation -> YieldObservation -> Decimal
+impliedApr earlier later
+  | later.exchangeRate > earlier.exchangeRate = later.apr
+  | otherwise = 0.0

@@ -1,0 +1,231 @@
+-- | End-to-end test of the Fission Protocol.
+-- Walks through: register asset, issue credential, mint SY, split into PT+YT,
+-- ratchet the index, claim yield, redeem at maturity.
+module Fission.Test.EndToEnd where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import Fission.Asset.Registry
+import Fission.Credential
+import Fission.SY
+import Fission.PY
+import Fission.Oracle
+import Fission.AMM
+
+-- | Test parties.
+data Parties = Parties
+  with
+    operator   : Party
+    custodian  : Party
+    oracle     : Party
+    kycProvider : Party
+    sequencer  : Party
+    public     : Party
+    alice      : Party  -- accredited investor
+    bob        : Party  -- liquidity provider
+
+setupParties : Script Parties
+setupParties = do
+  operator   <- allocateParty "operator"
+  custodian  <- allocateParty "custodian"
+  oracle     <- allocateParty "oracle"
+  kycProvider <- allocateParty "kyc-provider"
+  sequencer  <- allocateParty "sequencer"
+  public     <- allocateParty "public"
+  alice      <- allocateParty "alice"
+  bob        <- allocateParty "bob"
+  return Parties with ..
+
+-- | Issue a KYC certificate to a user.
+issueKyc : Parties -> Party -> CredentialClass -> Script (ContractId KycCertificate)
+issueKyc p user tier = do
+  now <- getTime
+  proposalCid <- submit p.kycProvider $ createCmd KycCertificateProposal with
+    kycProvider = p.kycProvider
+    user = user
+    tier = tier
+    jurisdiction = Jurisdiction "US-Q"  -- US qualified investor
+    expiresAt = addRelTime now (days 365)
+    sanctionsCheckedAt = now
+    custodians = [p.custodian]
+  submit user $ exerciseCmd proposalCid AcceptCertificate
+
+-- | Run the full lifecycle scenario.
+testFullLifecycle : Script ()
+testFullLifecycle = do
+  p <- setupParties
+
+  -- 1. Operator registers USYC.
+  let usyc = AssetCode "USYC"
+  let usycCfg = AssetConfig with
+        code = usyc
+        displayName = "Hashnote/Circle US Yield Coin"
+        yieldKind = RisingNav
+        credentialClass = AccreditedInvestor
+        oracleParty = p.oracle
+        custodian = p.custodian
+        initialIndex = 1.0
+        decimals = 6
+
+  registryCid <- submit p.operator $ createCmd AssetRegistry with
+    operator = p.operator
+    assets = []
+    public = p.public
+  registryCid <- submit p.operator $ exerciseCmd registryCid ListAsset with cfg = usycCfg
+
+  -- 2. KYC provider issues certificates to Alice and Bob.
+  aliceKyc <- issueKyc p p.alice AccreditedInvestor
+  bobKyc   <- issueKyc p p.bob   AccreditedInvestor
+
+  -- 3. Operator deploys SY instrument for USYC.
+  let syId = mkSyInstrumentId usyc
+  syInstCid <- submit p.operator $ createCmd SyInstrument with
+    issuer = p.operator
+    instrumentId = syId
+    assetCode = usyc
+    custodian = p.custodian
+    oracleParty = p.oracle
+    requiredTier = AccreditedInvestor
+    decimals = 6
+    public = p.public
+
+  -- 4. Oracle publishes initial yield observation (rate = 1.0).
+  now <- getTime
+  let obs0 = YieldObservation with
+        assetCode = usyc
+        exchangeRate = 1.0
+        observedAt = now
+        apr = 0.05  -- 5% APR
+  feedCid <- submit p.oracle $ createCmd YieldOracleFeed with
+    oracleParty = p.oracle
+    assetCode = usyc
+    latest = obs0
+    history = []
+    public = p.public
+
+  -- 5. Alice mints 1000 SY-USYC.
+  syHoldingCid <- submitMulti [p.alice, p.custodian] [] $
+    exerciseCmd syInstCid MintSy with
+      owner = p.alice
+      amount = 1000.0
+      kycCertCid = aliceKyc
+
+  -- 6. Operator deploys PY market with 6-month maturity.
+  let maturity = Maturity (addRelTime now (days 180))
+  let ptId = mkPtInstrumentId usyc maturity
+  let ytId = mkYtInstrumentId usyc maturity
+
+  marketCid <- submit p.operator $ createCmd PyMarket with
+    issuer = p.operator
+    assetCode = usyc
+    maturity = maturity
+    custodian = p.custodian
+    oracleParty = p.oracle
+    requiredTier = AccreditedInvestor
+    syInstrumentId = syId
+    ptInstrumentId = ptId
+    ytInstrumentId = ytId
+    public = p.public
+
+  indexCid <- submit p.operator $ createCmd PyIndexState with
+    issuer = p.operator
+    oracleParty = p.oracle
+    assetCode = usyc
+    maturity = maturity
+    currentIndex = 1.0
+    lastUpdated = now
+    public = p.public
+
+  -- 7. Alice splits 1000 SY into 1000 PT + 1000 YT.
+  (ptCid, ytCid) <- submitMulti [p.alice, p.custodian] [] $
+    exerciseCmd marketCid MintPY with
+      owner = p.alice
+      syHoldingCid = syHoldingCid
+      amount = 1000.0
+      kycCertCid = aliceKyc
+      indexStateCid = indexCid
+
+  -- 8. Time passes; oracle reports 2.5% accrued (index 1.025).
+  passTime (days 90)
+  now2 <- getTime
+  feedCid <- submit p.oracle $ exerciseCmd feedCid Publish with
+    observation = YieldObservation with
+      assetCode = usyc
+      exchangeRate = 1.025
+      observedAt = now2
+      apr = 0.05
+
+  -- Ratchet the index.
+  indexCid <- submit p.oracle $ exerciseCmd indexCid RatchetIndex with
+    oracleFeedCid = feedCid
+
+  -- 9. Alice claims yield. Should receive 25 SY (= 0.025 * 1000).
+  (ytCid, syYieldCid) <- submitMulti [p.alice, p.custodian] [] $
+    exerciseCmd ytCid ClaimYield with
+      indexStateCid = indexCid
+      kycCertCid = aliceKyc
+      syInstrumentId = syId
+
+  case syYieldCid of
+    Some cid -> do
+      sy <- queryContractId p.alice cid
+      case sy of
+        Some h -> assertMsg "yield amount mismatch" (h.amount == 25.0)
+        None -> abort "yield SY not found"
+    None -> abort "expected yield"
+
+  -- 10. Maturity reached. Alice redeems PT 1:1 for SY.
+  passTime (days 91)
+  redeemedSy <- submitMulti [p.alice, p.custodian] [] $
+    exerciseCmd marketCid RedeemPostMaturity with
+      owner = p.alice
+      ptCid = ptCid
+      amount = 1000.0
+      kycCertCid = aliceKyc
+
+  sy <- queryContractId p.alice redeemedSy
+  case sy of
+    Some h -> assertMsg "redemption amount mismatch" (h.amount == 1000.0)
+    None -> abort "redeemed SY not found"
+
+  debug "End-to-end lifecycle test passed."
+
+-- | Test the negative-yield ratchet protection.
+testNegativeYieldRatchet : Script ()
+testNegativeYieldRatchet = do
+  p <- setupParties
+  let usyc = AssetCode "USYC"
+  now <- getTime
+  let maturity = Maturity (addRelTime now (days 180))
+
+  indexCid <- submit p.operator $ createCmd PyIndexState with
+    issuer = p.operator
+    oracleParty = p.oracle
+    assetCode = usyc
+    maturity = maturity
+    currentIndex = 1.05
+    lastUpdated = now
+    public = p.public
+
+  -- Oracle reports a LOWER rate than current (negative yield event).
+  feedCid <- submit p.oracle $ createCmd YieldOracleFeed with
+    oracleParty = p.oracle
+    assetCode = usyc
+    latest = YieldObservation with
+      assetCode = usyc
+      exchangeRate = 1.02   -- lower than current 1.05
+      observedAt = now
+      apr = 0.02
+    history = []
+    public = p.public
+
+  -- Ratchet should hold the index FLAT, not decrease it.
+  indexCid <- submit p.oracle $ exerciseCmd indexCid RatchetIndex with
+    oracleFeedCid = feedCid
+
+  state <- queryContractId p.operator indexCid
+  case state of
+    Some s -> assertMsg "ratchet decreased - bug!" (s.currentIndex >= 1.05)
+    None -> abort "index state not found"
+
+  debug "Ratchet correctly protected PT holders from negative yield."

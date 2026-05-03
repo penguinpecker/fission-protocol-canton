@@ -1,0 +1,43 @@
+# Daml build artifacts
+.daml/
+*.dar
+
+# Node
+node_modules/
+dist/
+.next/
+.cache/
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Splice bundle - downloaded separately
+splice-bundle/
+
+# Build output
+backend/dist/
+frontend/dist/
+
+# Local bootstrap output
+.env.bootstrap
+
+# Splice LocalNet bundle (downloaded separately, ~700MB)
+splice-node/
+0.6.2_splice-node.tar.gz
+splice-bundle

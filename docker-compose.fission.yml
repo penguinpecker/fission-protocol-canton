@@ -1,0 +1,74 @@
+# Fission LocalNet
+# ----------------
+# This compose file is intentionally a thin layer over the official Splice LocalNet
+# bundle published by Digital Asset. We do not re-host their images; we use the
+# canonical ones and add only the two Fission services that need to run alongside.
+#
+# Bring up Splice LocalNet first using their docker-compose bundle:
+#   1. Download the Splice release: https://github.com/hyperledger-labs/splice/releases
+#   2. Extract: tar -xzf splice-<version>.tar.gz
+#   3. From the extracted directory: docker compose -f compose.yaml up -d
+#
+# That brings up: super-validator, validator, canton-coin-wallet, keycloak, postgres, pqs.
+#
+# Then from THIS repository run:
+#   docker compose -f docker-compose.fission.yml up -d
+#
+# This will start the Fission backend, oracle keeper, and sequencer, all networked
+# to the splice_default network.
+
+version: '3.9'
+
+networks:
+  default:
+    name: splice_default
+    external: true
+
+services:
+  fission-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fission-backend
+    restart: unless-stopped
+    environment:
+      - LEDGER_API_URL=http://validator-app-validator:2975
+      - KEYCLOAK_TOKEN_URL=http://keycloak:8082/realms/AppProvider/protocol/openid-connect/token
+      - KEYCLOAK_REALM_URL=http://keycloak:8082/realms/AppUser
+      - KEYCLOAK_CLIENT_ID=app-provider-validator
+      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET}
+      - OPERATOR_PARTY=${OPERATOR_PARTY}
+      - CUSTODIAN_PARTY=${CUSTODIAN_PARTY}
+      - ORACLE_PARTY=${ORACLE_PARTY}
+      - PORT=3001
+      - HOST=0.0.0.0
+      - CORS_ORIGINS=http://localhost:5173
+    ports:
+      - '3001:3001'
+
+  fission-oracle:
+    build:
+      context: ./services/oracle
+      dockerfile: Dockerfile
+    container_name: fission-oracle
+    restart: unless-stopped
+    environment:
+      - LEDGER_API_URL=http://validator-app-validator:2975
+      - ORACLE_PARTY=${ORACLE_PARTY}
+      - ORACLE_JWT_TOKEN=${ORACLE_JWT_TOKEN}
+      - ASSET_CODE=USYC
+      - USYC_API_URL=https://usyc.hashnote.com/api/price-reports
+      - POLL_INTERVAL_MS=60000
+
+  fission-sequencer:
+    build:
+      context: ./services/sequencer
+      dockerfile: Dockerfile
+    container_name: fission-sequencer
+    restart: unless-stopped
+    environment:
+      - LEDGER_API_URL=http://validator-app-validator:2975
+      - SEQUENCER_PARTY=${SEQUENCER_PARTY}
+      - SEQUENCER_JWT_TOKEN=${SEQUENCER_JWT_TOKEN}
+      - BATCH_INTERVAL_MS=3000
+      - MAX_BATCH_SIZE=100

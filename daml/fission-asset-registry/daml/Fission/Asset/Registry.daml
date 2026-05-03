@@ -1,0 +1,92 @@
+-- | Fission Asset Registry
+-- Maintains the whitelist of approved underlying instruments that can be wrapped into SY tokens.
+-- Each entry binds a logical asset code (e.g. "USYC") to its on-ledger instrument key, oracle source,
+-- and the credential schema that holders of derivatives of this asset must satisfy.
+module Fission.Asset.Registry where
+
+import qualified DA.Text as T
+
+-- | A logical identifier for an underlying asset (e.g. "USYC", "CBTC", "CC-STREAM").
+newtype AssetCode = AssetCode { unAssetCode : Text }
+  deriving (Eq, Show, Ord)
+
+-- | The mechanism by which yield accrues on an underlying.
+--   RisingNav: token price climbs over time, yield is captured implicitly (USYC pattern)
+--   Rebasing:  balance increases periodically, supply grows (stETH pattern)
+--   Streaming: discrete coupon-like distributions on a schedule (CC reward stream)
+data YieldKind = RisingNav | Rebasing | Streaming
+  deriving (Eq, Show)
+
+-- | Required credential class for any user holding a derivative of this asset.
+data CredentialClass
+  = Permissionless        -- ^ no KYC required (e.g. CC reward streams)
+  | RetailKyc             -- ^ standard KYC (basic AML/sanctions)
+  | AccreditedInvestor    -- ^ accredited / qualified investor (USYC requires this)
+  | InstitutionalOnly     -- ^ institutional counterparties only
+  deriving (Eq, Show, Ord)
+
+-- | Configuration for a single registered underlying.
+data AssetConfig = AssetConfig
+  with
+    code            : AssetCode
+    displayName     : Text
+    yieldKind       : YieldKind
+    credentialClass : CredentialClass
+    -- | The party authorised to publish yield/NAV observations for this asset.
+    oracleParty     : Party
+    -- | The custodian responsible for issuing CIP-56 holdings of the underlying.
+    custodian       : Party
+    -- | Initial index value for the PY ratchet (typically 1.0 in 18-decimal fixed-point).
+    initialIndex    : Decimal
+    -- | Decimal precision used for amounts.
+    decimals        : Int
+  deriving (Eq, Show)
+
+-- | The authoritative registry contract. There is exactly one of these per Fission deployment.
+template AssetRegistry
+  with
+    operator : Party
+    assets   : [AssetConfig]
+    public   : Party
+  where
+    signatory operator
+    observer public
+
+    -- | Operator may add a new approved asset. Re-creates the registry with the new entry.
+    nonconsuming choice ListAsset : ContractId AssetRegistry
+      with
+        cfg : AssetConfig
+      controller operator
+      do
+        assertMsg "asset code already registered"
+          (not $ any (\a -> a.code == cfg.code) assets)
+        assertMsg "decimals must be positive" (cfg.decimals > 0)
+        archive self
+        create this with assets = cfg :: assets
+
+    -- | Operator may delist an asset (does not affect existing holdings of derivatives).
+    nonconsuming choice DelistAsset : ContractId AssetRegistry
+      with
+        code : AssetCode
+      controller operator
+      do
+        archive self
+        create this with assets = filter (\a -> a.code /= code) assets
+
+    -- | Lookup helper - returns the configuration for an asset code if registered.
+    nonconsuming choice LookupAsset : Optional AssetConfig
+      with
+        code : AssetCode
+      controller operator
+      do
+        return $ headOpt $ filter (\a -> a.code == code) assets
+
+-- | Helper: find first matching element.
+headOpt : [a] -> Optional a
+headOpt []     = None
+headOpt (x::_) = Some x
+
+-- | Helper: validate an asset code is non-empty alphanumeric.
+isValidAssetCode : AssetCode -> Bool
+isValidAssetCode (AssetCode c) =
+  T.length c > 0 && T.length c <= 32

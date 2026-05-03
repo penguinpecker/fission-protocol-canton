@@ -1,0 +1,141 @@
+-- | Fission SY (Standardized Yield)
+-- Wraps any yield-bearing underlying into a uniform, fungible interface that the rest of the
+-- protocol can interact with. Inspired by EIP-5115. The key insight: all SY tokens behave
+-- identically from the perspective of the PT/YT split, regardless of whether the underlying
+-- is rising-NAV (USYC), rebasing (stETH-style), or streaming (CC reward streams).
+--
+-- Yield in SY is expressed via an "exchange rate" that grows monotonically over time.
+-- 1 SY at deposit = 1 unit of the underlying. Over time, exchangeRate grows so that
+-- 1 SY = exchangeRate * 1 underlying. This is the cleanest possible mapping for PT/YT math.
+module Fission.SY where
+
+import Fission.Asset.Registry (AssetCode(..), CredentialClass)
+import Fission.Credential (KycCertificate, isCredentialValid)
+
+-- | Globally unique identifier for an SY instrument.
+newtype InstrumentId = InstrumentId { unInstrumentId : Text }
+  deriving (Eq, Show, Ord)
+
+-- | Compose an SY instrument id from an asset code.
+mkSyInstrumentId : AssetCode -> InstrumentId
+mkSyInstrumentId (AssetCode c) = InstrumentId $ "SY-" <> c
+
+-- | The SY instrument metadata. Singleton per (issuer, asset).
+template SyInstrument
+  with
+    issuer          : Party
+    instrumentId    : InstrumentId
+    assetCode       : AssetCode
+    custodian       : Party
+    oracleParty     : Party
+    requiredTier    : CredentialClass
+    decimals        : Int
+    public          : Party
+  where
+    signatory issuer
+    observer public, custodian
+
+    -- | Mint a fresh SY holding by depositing underlying.
+    --   Caller must hold a valid KYC cert at the required tier.
+    --   Underlying transfer is enforced separately (this contract just records the SY claim).
+    nonconsuming choice MintSy : ContractId SyHolding
+      with
+        owner          : Party
+        amount         : Decimal
+        kycCertCid     : ContractId KycCertificate
+      controller owner, custodian
+      do
+        assertMsg "amount must be positive" (amount > 0.0)
+        cert <- fetch kycCertCid
+        now <- getTime
+        assertMsg "KYC certificate is invalid or expired"
+          (isCredentialValid now requiredTier cert)
+        assertMsg "KYC certificate not issued to caller" (cert.user == owner)
+        create SyHolding with
+          issuer = issuer
+          owner = owner
+          custodian = custodian
+          instrumentId = instrumentId
+          amount = amount
+          mintedAt = now
+
+    -- | Burn SY back to the underlying.
+    nonconsuming choice BurnSy : ()
+      with
+        holdingCid : ContractId SyHolding
+        amount     : Decimal
+      controller custodian
+      do
+        h <- fetch holdingCid
+        assertMsg "burn amount exceeds holding" (h.amount >= amount)
+        archive holdingCid
+        if h.amount > amount
+          then do
+            _ <- create h with amount = h.amount - amount
+            return ()
+          else return ()
+
+-- | A holding (UTXO-style) of SY tokens.
+template SyHolding
+  with
+    issuer       : Party
+    owner        : Party
+    custodian    : Party
+    instrumentId : InstrumentId
+    amount       : Decimal
+    mintedAt     : Time
+  where
+    signatory issuer, custodian
+    observer owner
+
+    ensure amount > 0.0
+
+    -- | Owner can transfer SY to another KYC'd party. Both custodians (sender and recipient)
+    --   must observe the transfer; here we keep it simple by requiring same custodian.
+    choice TransferSy : ContractId SyHolding
+      with
+        newOwner       : Party
+        kycCertCid     : ContractId KycCertificate
+      controller owner, custodian
+      do
+        cert <- fetch kycCertCid
+        assertMsg "recipient KYC mismatch" (cert.user == newOwner)
+        now <- getTime
+        -- Transfer respects the same credential class as mint; this is a simplification.
+        -- Production: fetch the SyInstrument and check its requiredTier.
+        assertMsg "recipient KYC expired" (cert.expiresAt > now)
+        create this with owner = newOwner
+
+    -- | Split a holding into two for partial transfer or use in PY mint.
+    choice SplitSy : (ContractId SyHolding, ContractId SyHolding)
+      with
+        firstAmount : Decimal
+      controller owner
+      do
+        assertMsg "split amount must be positive" (firstAmount > 0.0)
+        assertMsg "split amount must be less than holding" (firstAmount < amount)
+        a <- create this with amount = firstAmount
+        b <- create this with amount = amount - firstAmount
+        return (a, b)
+
+    -- | Merge two holdings (same instrument, same owner) into one.
+    choice MergeSy : ContractId SyHolding
+      with
+        otherCid : ContractId SyHolding
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "instrument mismatch" (other.instrumentId == instrumentId)
+        assertMsg "owner mismatch" (other.owner == owner)
+        archive otherCid
+        create this with amount = amount + other.amount
+
+-- | Compute the underlying-equivalent value of an SY amount given the current exchange rate.
+syToUnderlying : Decimal -> Decimal -> Decimal
+syToUnderlying syAmount exchangeRate = syAmount * exchangeRate
+
+-- | Compute SY amount needed to represent a given underlying amount.
+underlyingToSy : Decimal -> Decimal -> Decimal
+underlyingToSy underlyingAmount exchangeRate
+  | exchangeRate > 0.0 = underlyingAmount / exchangeRate
+  | otherwise = error "exchange rate must be positive"

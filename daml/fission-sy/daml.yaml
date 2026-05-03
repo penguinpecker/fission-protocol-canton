@@ -1,0 +1,12 @@
+sdk-version: 3.4.11
+name: fission-sy
+source: daml
+version: 0.1.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../fission-asset-registry/.daml/dist/fission-asset-registry-0.1.0.dar
+  - ../fission-credential/.daml/dist/fission-credential-0.1.0.dar
+build-options:
+  - --target=2.1
