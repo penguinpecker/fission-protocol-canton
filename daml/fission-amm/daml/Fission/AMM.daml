@@ -20,10 +20,11 @@ module Fission.AMM where
 
 import DA.Time (minutes, addRelTime)
 import DA.Foldable (mapA_)
+import DA.Action (foldlA)
 import Fission.Asset.Registry (AssetCode(..), CredentialClass)
 import Fission.Credential (KycCertificate, isCredentialValid)
-import Fission.SY (SyHolding, InstrumentId(..))
-import Fission.PY (PtHolding, Maturity(..))
+import Fission.SY (SyHolding(..), InstrumentId(..))
+import Fission.PY (PtHolding(..), Maturity(..))
 
 -- | Identifier for a specific pool (asset, maturity).
 data PoolId = PoolId
@@ -150,31 +151,33 @@ template AmmPool
           deadline = addRelTime now (minutes 5)
 
     -- | Sequencer settles a batch of pending swaps in a single transaction.
-    --   This is what gives us throughput: 100 swaps -> 1 pool update.
-    -- Controllers include custodian so that PendingSwap (signatory issuer + custodian)
-    -- can be archived during settlement. Sequencer alone can't authorize archival of
-    -- contracts where custodian is a signatory.
+    --   For each swap we (a) archive the trader's input holding (or split it),
+    --   (b) create a fresh output holding owned by the trader for amountOut,
+    --   (c) update the running reserves.  The whole batch lands as one Canton
+    --   transaction, archiving every PendingSwap and rebuilding this AmmPool
+    --   contract with new reserves.
+    --
+    --   Authority chain: AmmPool's signatory is `issuer` (operator); the choice
+    --   delegates that authority to its controllers (sequencer, custodian). With
+    --   issuer + custodian present we can archive and create SyHolding /
+    --   PtHolding contracts (both signed by issuer + custodian).
     nonconsuming choice SettleBatch : ContractId AmmPool
       with
         pendingCids : [ContractId PendingSwap]
       controller sequencer, custodian
       do
         now <- getTime
-        -- Read all pending swaps.
         pendings <- mapA fetch pendingCids
-        -- Filter to swaps that haven't expired and apply curve to compute outputs.
         let active = filter (\p -> p.deadline > now) pendings
 
-        -- For simplicity in this implementation, we apply each swap sequentially
-        -- against the running reserves. Production code would compute net flow first
-        -- and use Notional-style logit math; this is the readable version.
-        let (finalSyReserve, finalPtReserve) =
-              foldl applySwapToReserves (syReserve, ptReserve) active
+        (finalSyReserve, finalPtReserve) <-
+          foldlA (settleOneSwap now issuer custodian poolId syInstrumentId ptInstrumentId)
+                 (syReserve, ptReserve)
+                 active
 
-        -- Archive all pending swaps.
+        -- Archive every pending swap (active and expired alike).
         mapA_ archive pendingCids
 
-        -- Recreate pool with new reserves.
         archive self
         create this with
           syReserve = finalSyReserve
@@ -243,21 +246,71 @@ template LpHolding
 -- Helpers
 -- ----------------------------------------------------------------
 
--- | Apply a single swap to a (syReserve, ptReserve) pair, returning new reserves.
---   Uses constant-product (x*y=k) for clarity; production AMM uses Pendle V2 logit curve.
---   Pure function — no ledger access needed since pool state is in the fold accumulator.
-applySwapToReserves : (Decimal, Decimal) -> PendingSwap -> (Decimal, Decimal)
-applySwapToReserves (sy, pt) p =
-  let k = sy * pt
-  in case p.kind of
-    SyToPt ->
-      let newSy = sy + p.amountIn
-          newPt = k / newSy
-      in (newSy, newPt)
-    PtToSy ->
-      let newPt = pt + p.amountIn
-          newSy = k / newPt
-      in (newSy, newPt)
+-- | Settle one swap: archive the trader's input holding, create the output
+--   holding for them, and return updated (syReserve, ptReserve). Uses the
+--   constant-product invariant (x*y=k); production AMM would use Pendle V2's
+--   logit curve here.
+--
+--   Defensive: if the swap is malformed (missing input cid, or input balance
+--   short of amountIn, or slippage exceeds minAmountOut) we leave the
+--   reserves unchanged and continue with the rest of the batch. This keeps
+--   one bad swap from killing the entire batch transaction.
+settleOneSwap
+  : Time
+  -> Party    -- issuer (operator)
+  -> Party    -- custodian
+  -> PoolId
+  -> InstrumentId   -- syInstrumentId
+  -> InstrumentId   -- ptInstrumentId
+  -> (Decimal, Decimal)
+  -> PendingSwap
+  -> Update (Decimal, Decimal)
+settleOneSwap now issuer custodian poolId syInstrumentId ptInstrumentId (sy, pt) p =
+  let k = sy * pt in case p.kind of
+    SyToPt -> case p.syHoldingCid of
+      None -> pure (sy, pt)
+      Some inCid -> do
+        let newSy = sy + p.amountIn
+        let newPt = k / newSy
+        let amountOut = pt - newPt
+        if amountOut < p.minAmountOut then pure (sy, pt) else do
+          inHolding <- fetch inCid
+          if inHolding.amount < p.amountIn || inHolding.owner /= p.trader
+              || inHolding.instrumentId /= syInstrumentId
+            then pure (sy, pt)
+            else do
+              consumeSyOrSplit inHolding inCid p.amountIn
+              _ <- create PtHolding with
+                issuer = issuer
+                owner = p.trader
+                custodian = custodian
+                instrumentId = ptInstrumentId
+                assetCode = poolId.assetCode
+                maturity = poolId.maturity
+                amount = amountOut
+                mintedAt = now
+              pure (newSy, newPt)
+    PtToSy -> case p.ptHoldingCid of
+      None -> pure (sy, pt)
+      Some inCid -> do
+        let newPt = pt + p.amountIn
+        let newSy = k / newPt
+        let amountOut = sy - newSy
+        if amountOut < p.minAmountOut then pure (sy, pt) else do
+          inHolding <- fetch inCid
+          if inHolding.amount < p.amountIn || inHolding.owner /= p.trader
+              || inHolding.instrumentId /= ptInstrumentId
+            then pure (sy, pt)
+            else do
+              consumePtOrSplit inHolding inCid p.amountIn
+              _ <- create SyHolding with
+                issuer = issuer
+                owner = p.trader
+                custodian = custodian
+                instrumentId = syInstrumentId
+                amount = amountOut
+                mintedAt = now
+              pure (newSy, newPt)
 
 -- | Helper to consume an SY holding, splitting if the requested amount is less than holding.
 consumeSyOrSplit : SyHolding -> ContractId SyHolding -> Decimal -> Update ()
